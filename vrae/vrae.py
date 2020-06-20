@@ -7,6 +7,8 @@ from torch.utils.data import DataLoader
 from torch.autograd import Variable
 import os
 
+from distributions import VonMisesFisher
+from distributions import HypersphericalUniform
 
 class Encoder(nn.Module):
     """
@@ -54,14 +56,19 @@ class Lambda(nn.Module):
     :param hidden_size: hidden size of the encoder
     :param latent_length: latent vector length
     """
-    def __init__(self, hidden_size, latent_length):
+    def __init__(self, hidden_size, latent_length, distribution='normal'):
         super(Lambda, self).__init__()
 
         self.hidden_size = hidden_size
         self.latent_length = latent_length
+        self.distribution = distribution
 
-        self.hidden_to_mean = nn.Linear(self.hidden_size, self.latent_length)
-        self.hidden_to_logvar = nn.Linear(self.hidden_size, self.latent_length)
+        if self.distribution == 'normal':
+            self.hidden_to_mean = nn.Linear(self.hidden_size, self.latent_length)
+            self.hidden_to_logvar = nn.Linear(self.hidden_size, self.latent_length)
+        elif self.distribution =='vmf':
+            self.hidden_to_mean = nn.Linear(self.hidden_size, self.latent_length)
+            self.hidden_to_logvar = nn.Linear(self.hidden_size, 1)
 
         nn.init.xavier_uniform_(self.hidden_to_mean.weight)
         nn.init.xavier_uniform_(self.hidden_to_logvar.weight)
@@ -76,12 +83,64 @@ class Lambda(nn.Module):
         self.latent_mean = self.hidden_to_mean(cell_output)
         self.latent_logvar = self.hidden_to_logvar(cell_output)
 
-        if self.training:
-            std = torch.exp(0.5 * self.latent_logvar)
-            eps = torch.randn_like(std)
-            return eps.mul(std).add_(self.latent_mean)
+        # We're going to ignore the softplus as defined by s-VAE, as the log-var does keep the value positive
+
+        if self.distribution == 'normal':
+            if self.training:
+                std = torch.exp(0.5 * self.latent_logvar)
+                eps = torch.randn_like(std)
+                return eps.mul(std).add_(self.latent_mean)
+            else:
+                return self.latent_mean, self.latent_logvar
+        elif self.dsitribution == 'vmf':
+            self.latent_mean /= self.latent_mean.norm(dim=-1, keepDim=True) 
+            if self.training:
+                std = torch.exp(0.5 * self.latent_logvar) + 1
+                # the addition of 1 prevents collapsing behaviors
+                eps = torch.randn_like(std)
+                return eps.mul(std).add_(self.latent_mean)
+            else:
+                return self.latent_mean, self.latent_logvar
         else:
-            return self.latent_mean
+            raise NotImplemented
+
+
+class ReParam(nn.Module):
+    """ 
+    Samples the latent vector from distribution according to the mean and variance as computed in the Lambda class
+
+    :param latent_length: latent vector length
+    :param disribution: string type of distribution, 'normal' or 'vMF'
+    """
+
+    def __init__(self, latent_length, distribution)
+        super(ReParam, self).__init__()
+
+        self.latent_length = latent_length
+        self.distribution = distribution
+
+    def forward(self, latent_mean, latent_logvar)
+        """
+        Samples latent vector from mean and log-varaince
+
+        :param latent_mean: the mean of the latent vector
+        :param latent_logvar: log-varaince of the latent vector
+
+        :return: latent vector
+        """
+        latent_var = torch.exp(0.5 * latent_logvar)
+
+        if self.distribution == 'normal':
+            q_z = torch.distributions.normal.Normal(latent_mean, latent_var)
+            p_z = torch.distributions.normal.Normal(torch.zeros_like(latent_mean), torch.ones_like(latent_var))
+        elif self.distribution == 'vmf':
+            q_z = VonMisesFisher(latent_mean, latent_var)
+            p_z = HypersphericalUniform(self.latent_length - 1)
+        else:
+            raise NotImplemented
+
+        return q_z.rsample()
+
 
 class Decoder(nn.Module):
     """Converts latent vector into output
@@ -171,7 +230,7 @@ class VRAE(BaseEstimator, nn.Module):
     """
     def __init__(self, sequence_length, number_of_features, hidden_size=90, hidden_layer_depth=2, latent_length=20,
                  batch_size=32, learning_rate=0.005, block='LSTM',
-                 n_epochs=5, dropout_rate=0., optimizer='Adam', loss='MSELoss',
+                 n_epochs=5, dropout_rate=0., optimizer='Adam', loss='MSELoss', distribution='normal',
                  cuda=False, print_every=100, clip=True, max_grad_norm=5, dload='.'):
 
         super(VRAE, self).__init__()
@@ -196,7 +255,11 @@ class VRAE(BaseEstimator, nn.Module):
                                block=block)
 
         self.lmbd = Lambda(hidden_size=hidden_size,
-                           latent_length=latent_length)
+                           latent_length=latent_length, 
+                           distribution=distribution)
+
+        self.reparam = ReParam(latent_length=latent_length,
+                             distribution=distribution)
 
         self.decoder = Decoder(sequence_length=sequence_length,
                                batch_size = batch_size,
@@ -250,7 +313,8 @@ class VRAE(BaseEstimator, nn.Module):
         :return: the decoded output, latent vector
         """
         cell_output = self.encoder(x)
-        latent = self.lmbd(cell_output)
+        q_latent = self.lmbd(cell_output)
+        latent = self.reparam(q_latent)
         x_decoded = self.decoder(latent)
 
         return x_decoded, latent
